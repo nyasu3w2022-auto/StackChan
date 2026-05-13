@@ -14,17 +14,27 @@
  * hal_ezdata.cpp so that the connection lifecycle (connect, auto-reconnect,
  * destroy) is handled uniformly by the Mooncake extension manager.
  *
+ * Startup sequence
+ * ----------------
+ * startMqttMachineService() is called from Hal::startXiaozhi() BEFORE
+ * hal_bridge::start_xiaozhi_app() returns, which means the lwIP TCP/IP
+ * stack and WiFi are not yet up at that point.  To avoid the
+ * "Invalid mbox" assert in tcpip_send_msg_wait_sem, _connect() first
+ * checks WifiManager::IsConnected() and silently skips the attempt when
+ * WiFi is not ready.  The update() loop retries every kReconnectMs ms,
+ * so the MQTT connection is established automatically once WiFi comes up.
+ *
  * Configuration placeholders
  * --------------------------
  * Replace the values in MqttMachineConfig with your actual broker settings
  * before building.  A future improvement could load these from NVS via the
  * Settings class (see hal_account.cpp for an example).
  *
- *   MQTT_BROKER_HOST   : hostname or IP address of the MQTT broker
- *   MQTT_BROKER_PORT   : broker port (1883 for plain TCP, 8883 for TLS)
- *   MQTT_CLIENT_ID     : client identifier sent during CONNECT
- *   MQTT_TOPIC_PREFIX  : topic prefix; the full topic will be
- *                        "<prefix>/<machine_name>"
+ *   kBrokerHost   : hostname or IP address of the MQTT broker
+ *   kBrokerPort   : broker port (1883 for plain TCP, 8883 for TLS)
+ *   kClientId     : client identifier sent during CONNECT
+ *   kTopicPrefix  : topic prefix; the full topic will be
+ *                   "<prefix>/<machine_name>"
  *
  * Publish payload
  * ---------------
@@ -38,6 +48,7 @@
 #include <mooncake_log.h>
 #include <board.h>
 #include <mqtt.h>
+#include <wifi_manager.h>
 #include <esp_log.h>
 #include <mutex>
 #include <queue>
@@ -88,16 +99,25 @@ public:
 
     void init()
     {
-        _connect();
+        // Do NOT call _connect() here.
+        // WiFi (and therefore the lwIP TCP/IP stack) is not yet up when
+        // startMqttMachineService() is called from Hal::startXiaozhi().
+        // The update() loop will attempt the first connection once WiFi
+        // becomes available.
+        mclog::tagInfo(_tag, "service initialized, waiting for WiFi...");
     }
 
     void update()
     {
-        if (!_mqtt) {
+        // Guard: never touch the TCP/IP stack while WiFi is not connected.
+        if (!WifiManager::GetInstance().IsConnected()) {
+            // Reset the reconnect timer so that _connect() is attempted
+            // immediately after WiFi comes up rather than waiting kReconnectMs.
+            _last_reconnect_attempt = 0;
             return;
         }
 
-        if (!_mqtt->IsConnected()) {
+        if (!_mqtt || !_mqtt->IsConnected()) {
             if (GetHAL().millis() - _last_reconnect_attempt > MqttMachineConfig::kReconnectMs) {
                 mclog::tagInfo(_tag, "reconnecting...");
                 _connect();
@@ -137,9 +157,10 @@ private:
 
     void _connect()
     {
+        // Destroy any stale instance before creating a new one.
         _mqtt.reset();
 
-        auto& board  = Board::GetInstance();
+        auto& board   = Board::GetInstance();
         auto  network = board.GetNetwork();
 
         _mqtt = network->CreateMqtt(2);  // connect_id=2 (0: protocol, 1: ezdata)
@@ -165,7 +186,7 @@ private:
         mclog::tagInfo(_tag, "connecting to {}:{} as {}", MqttMachineConfig::kBrokerHost,
                        MqttMachineConfig::kBrokerPort, MqttMachineConfig::kClientId);
 
-        // No authentication — pass empty strings for username and password
+        // No authentication — pass empty strings for username and password.
         _mqtt->Connect(MqttMachineConfig::kBrokerHost, MqttMachineConfig::kBrokerPort,
                        MqttMachineConfig::kClientId, "", "");
 
