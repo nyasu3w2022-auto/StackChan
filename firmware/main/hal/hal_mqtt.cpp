@@ -9,20 +9,26 @@
  * @brief MQTT service for machine ON/OFF control via MCP tools.
  *
  * This module manages a single persistent MQTT connection used to publish
- * power-control commands to external machines.  It follows the same
- * BasicAbility / worker pattern used by hal_ws_avatar.cpp and
- * hal_ezdata.cpp so that the connection lifecycle (connect, auto-reconnect,
- * destroy) is handled uniformly by the Mooncake extension manager.
+ * power-control commands to external machines.
+ *
+ * Implementation note — why FreeRTOS task instead of BasicAbility
+ * ---------------------------------------------------------------
+ * startMqttMachineService() is called from Hal::startXiaozhi(), which runs
+ * AFTER DestroyMooncake() in main.cpp.  At that point the Mooncake singleton
+ * has been destroyed and recreated as an empty instance with no update() loop
+ * driving it.  Registering a BasicAbility via extensionManager()->createAbility()
+ * would therefore never have its onRunning() called.
+ *
+ * The same pattern used by _stackchan_update_task (xTaskCreatePinnedToCore)
+ * is used here so the update loop runs independently of Mooncake.
  *
  * Startup sequence
  * ----------------
- * startMqttMachineService() is called from Hal::startXiaozhi() BEFORE
- * hal_bridge::start_xiaozhi_app() returns, which means the lwIP TCP/IP
- * stack and WiFi are not yet up at that point.  To avoid the
- * "Invalid mbox" assert in tcpip_send_msg_wait_sem, _connect() first
- * checks WifiManager::IsConnected() and silently skips the attempt when
- * WiFi is not ready.  The update() loop retries every kReconnectMs ms,
- * so the MQTT connection is established automatically once WiFi comes up.
+ * startMqttMachineService() is called before Application::Initialize() ->
+ * board.StartNetwork(), so WiFi and the lwIP TCP/IP stack are not yet up.
+ * To avoid the "Invalid mbox" assert, update() checks
+ * WifiManager::IsConnected() and skips _connect() while WiFi is down.
+ * Once WiFi comes up the reconnect timer fires immediately.
  *
  * Configuration placeholders
  * --------------------------
@@ -44,12 +50,12 @@
  */
 
 #include "hal.h"
-#include <mooncake.h>
 #include <mooncake_log.h>
 #include <board.h>
 #include <mqtt.h>
 #include <wifi_manager.h>
-#include <esp_log.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 #include <mutex>
 #include <queue>
 #include <string>
@@ -72,6 +78,8 @@ struct MqttMachineConfig {
     static constexpr int         kPublishQos   = 0;
     // Reconnect interval in milliseconds
     static constexpr uint32_t    kReconnectMs  = 5000;
+    // Update tick interval in milliseconds
+    static constexpr uint32_t    kTickMs       = 100;
 };
 
 }  // namespace
@@ -85,10 +93,11 @@ static const std::string _tag = "HAL-MQTT";
 /**
  * @brief Encapsulates the MQTT connection and publish logic.
  *
- * Designed to be owned by MqttMachineWorker and driven by its onRunning()
- * tick.  Thread-safety for publishMachine() is provided by an internal
+ * Driven by a dedicated FreeRTOS task (_mqtt_machine_task) so that it
+ * continues to run after DestroyMooncake() is called in main.cpp.
+ * Thread-safety for publishMachine() is provided by an internal
  * mutex-guarded queue so that MCP tool callbacks (running in the Xiaozhi
- * task) can safely enqueue publish requests without blocking.
+ * audio task) can safely enqueue publish requests without blocking.
  */
 class MqttMachineService {
 public:
@@ -97,22 +106,12 @@ public:
         bool        powerOn;
     };
 
-    void init()
-    {
-        // Do NOT call _connect() here.
-        // WiFi (and therefore the lwIP TCP/IP stack) is not yet up when
-        // startMqttMachineService() is called from Hal::startXiaozhi().
-        // The update() loop will attempt the first connection once WiFi
-        // becomes available.
-        mclog::tagInfo(_tag, "service initialized, waiting for WiFi...");
-    }
-
     void update()
     {
         // Guard: never touch the TCP/IP stack while WiFi is not connected.
         if (!WifiManager::GetInstance().IsConnected()) {
-            // Reset the reconnect timer so that _connect() is attempted
-            // immediately after WiFi comes up rather than waiting kReconnectMs.
+            // Reset the reconnect timer so that _connect() fires immediately
+            // after WiFi comes up rather than waiting kReconnectMs.
             _last_reconnect_attempt = 0;
             return;
         }
@@ -130,8 +129,8 @@ public:
     /**
      * @brief Enqueue a power-control publish request (thread-safe).
      *
-     * This method is safe to call from any task, including the MCP tool
-     * callback that runs in the Xiaozhi audio task context.
+     * Safe to call from any task, including the MCP tool callback that runs
+     * in the Xiaozhi audio task context.
      *
      * @param machineName  Logical name of the target machine.
      * @param powerOn      true = turn ON (publish "1"), false = turn OFF (publish "0").
@@ -219,47 +218,25 @@ private:
 };
 
 /* -------------------------------------------------------------------------- */
-/*                         MqttMachineWorker (BasicAbility)                    */
+/*                         FreeRTOS task                                       */
 /* -------------------------------------------------------------------------- */
 
-class MqttMachineWorker : public mooncake::BasicAbility {
-public:
-    MqttMachineWorker()
-    {
-        _service = std::make_unique<MqttMachineService>();
-        _service->init();
-    }
+static MqttMachineService* _service_ptr = nullptr;
 
-    void onRunning() override
-    {
-        // Throttle to ~50 ms tick to avoid busy-looping
-        if (GetHAL().millis() - _last_tick < 50) {
-            return;
-        }
-        _last_tick = GetHAL().millis();
-        _service->update();
+static void _mqtt_machine_task(void* param)
+{
+    auto* service = static_cast<MqttMachineService*>(param);
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(MqttMachineConfig::kTickMs));
+        service->update();
     }
-
-    void onDestroy() override
-    {
-        _service.reset();
-    }
-
-    MqttMachineService* service()
-    {
-        return _service.get();
-    }
-
-private:
-    std::unique_ptr<MqttMachineService> _service;
-    uint32_t _last_tick = 0;
-};
+}
 
 /* -------------------------------------------------------------------------- */
 /*                          Hal public API                                     */
 /* -------------------------------------------------------------------------- */
 
-static MqttMachineWorker* _mqtt_worker = nullptr;
+static std::unique_ptr<MqttMachineService> _service;
 
 void Hal::startMqttMachineService(std::function<void(std::string_view)> onStartLog)
 {
@@ -269,16 +246,19 @@ void Hal::startMqttMachineService(std::function<void(std::string_view)> onStartL
         onStartLog("Starting MQTT\nmachine service...");
     }
 
-    auto worker = std::make_unique<MqttMachineWorker>();
-    _mqtt_worker = worker.get();
-    mooncake::GetMooncake().extensionManager()->createAbility(std::move(worker));
+    _service     = std::make_unique<MqttMachineService>();
+    _service_ptr = _service.get();
+
+    // Spawn a dedicated FreeRTOS task on core 1 (same as _stackchan_update_task).
+    // Stack size 4096 bytes is sufficient for the MQTT client operations.
+    xTaskCreatePinnedToCore(_mqtt_machine_task, "mqtt_machine", 4096, _service_ptr, 3, NULL, 1);
 }
 
 void Hal::mqttPublishMachine(const std::string& machineName, bool powerOn)
 {
-    if (!_mqtt_worker || !_mqtt_worker->service()) {
+    if (!_service_ptr) {
         mclog::tagError(_tag, "mqttPublishMachine: service not started");
         return;
     }
-    _mqtt_worker->service()->publishMachine(machineName, powerOn);
+    _service_ptr->publishMachine(machineName, powerOn);
 }
