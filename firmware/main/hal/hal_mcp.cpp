@@ -146,4 +146,35 @@ void Hal::xiaozhi_mcp_init()
                            tools::stop_reminder(id);
                            return true;
                        });
+
+    // -------------------------------------------------------------------------
+    // Machine power control via MQTT
+    // -------------------------------------------------------------------------
+    // The MQTT machine-control service must be started (startMqttMachineService)
+    // before these tools are invoked.  Publish requests are queued internally
+    // and sent asynchronously, so the callbacks return immediately.
+
+    mclog::tagInfo(_tag, "add machine.set_power tool");
+    mcp_server.AddTool(
+        "self.machine.set_power",
+        "Turn a named machine ON or OFF by publishing to an MQTT topic. "
+        "Use power=true to turn ON and power=false to turn OFF. "
+        "The machine_name must exactly match the configured device name.",
+        PropertyList({Property("machine_name", kPropertyTypeString, std::string("")),
+                      Property("power", kPropertyTypeBoolean, false)}),
+        [this](const PropertyList& properties) -> ReturnValue {
+            std::string machine_name = properties["machine_name"].value<std::string>();
+            bool        power_on     = properties["power"].value<bool>();
+
+            if (machine_name.empty()) {
+                mclog::tagError(_tag, "machine.set_power: machine_name is empty");
+                return false;
+            }
+
+            mclog::tagInfo(_tag, "machine.set_power: name={}, power={}", machine_name,
+                           power_on ? "ON" : "OFF");
+
+            GetHAL().mqttPublishMachine(machine_name, power_on);
+            return true;
+        });
 }

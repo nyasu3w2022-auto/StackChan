@@ -300,6 +300,30 @@ public:
     void getMicWaveformFrame(std::vector<int16_t>& data);
     void clearupMicTest();
 
+    /* --------------------------- MQTT Machine Control ------------------------- */
+    /**
+     * @brief Start the MQTT machine-control service.
+     *
+     * Must be called after startNetwork().  Internally creates a persistent
+     * MQTT connection and registers a Mooncake BasicAbility worker that
+     * handles reconnection and publish queuing.
+     *
+     * @param onStartLog  Optional callback for startup progress messages.
+     */
+    void startMqttMachineService(std::function<void(std::string_view)> onStartLog = nullptr);
+
+    /**
+     * @brief Publish a power-control command for a named machine (thread-safe).
+     *
+     * The request is enqueued internally and sent on the next service tick,
+     * so this method returns immediately and is safe to call from any task
+     * (including MCP tool callbacks).
+     *
+     * @param machineName  Logical name of the target machine.
+     * @param powerOn      true = turn ON, false = turn OFF.
+     */
+    void mqttPublishMachine(const std::string& machineName, bool powerOn);
+
 private:
     bool _xiaozhi_start_requested = false;
 

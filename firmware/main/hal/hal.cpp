@@ -199,6 +199,13 @@ void Hal::startXiaozhi()
     // Start stackchan update task
     xTaskCreatePinnedToCore(_stackchan_update_task, "stackchan", 4096, NULL, 3, NULL, 1);
 
+    // Start MQTT machine-control service.
+    // Network (WiFi) is brought up inside hal_bridge::start_xiaozhi_app() via
+    // Application::Initialize() -> board.StartNetwork(), so we start the MQTT
+    // service here — the internal reconnect loop will establish the broker
+    // connection once the network becomes available.
+    startMqttMachineService();
+
     hal_bridge::start_xiaozhi_app();
 }
 
