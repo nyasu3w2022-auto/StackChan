@@ -205,6 +205,7 @@ void Hal::startXiaozhi()
     // service here — the internal reconnect loop will establish the broker
     // connection once the network becomes available.
     startMqttMachineService();
+    mqttSubscribeAlert();
 
     hal_bridge::start_xiaozhi_app();
 }

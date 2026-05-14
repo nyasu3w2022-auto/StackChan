@@ -6,10 +6,30 @@
 
 /**
  * @file hal_mqtt.cpp
- * @brief MQTT service for machine ON/OFF control via MCP tools.
+ * @brief MQTT service for machine ON/OFF control (publish) and text-to-alert
+ *        (subscribe) via MCP tools.
  *
- * This module manages a single persistent MQTT connection used to publish
- * power-control commands to external machines.
+ * Publish — machine power control
+ * --------------------------------
+ * MCP tool "self.machine.set_power" enqueues a publish request via
+ * mqttPublishMachine().  The service tick dequeues and publishes to:
+ *   <kTopicPrefix>/<machine_name>   payload "1" (ON) or "0" (OFF)
+ *
+ * Subscribe — text alert
+ * ----------------------
+ * After connecting, the service subscribes to kSpeakTopic.  When a message
+ * arrives the payload is forwarded to the Xiaozhi main task via
+ * Application::Schedule() (hal_bridge::app_schedule) so that:
+ *   1. Application::Alert() updates the on-screen display.
+ *   2. TimedSpeechModifier + SpeakingModifier animate the avatar mouth.
+ *   3. app_play_sound() plays a notification chime.
+ *
+ * Thread-safety
+ * -------------
+ * OnMessage() is called from the esp-mqtt internal task.  All UI/display
+ * operations are dispatched to the Xiaozhi main task via app_schedule() to
+ * avoid holding any LVGL lock from the mqtt task context, eliminating the
+ * risk of priority-inversion deadlock between the mqtt_task and lvgl_port_task.
  *
  * Implementation note — why FreeRTOS task instead of BasicAbility
  * ---------------------------------------------------------------
@@ -39,8 +59,9 @@
  *   kBrokerHost   : hostname or IP address of the MQTT broker
  *   kBrokerPort   : broker port (1883 for plain TCP, 8883 for TLS)
  *   kClientId     : client identifier sent during CONNECT
- *   kTopicPrefix  : topic prefix; the full topic will be
+ *   kTopicPrefix  : topic prefix for publish; full topic is
  *                   "<prefix>/<machine_name>"
+ *   kSpeakTopic   : topic to subscribe for text-to-alert messages
  *
  * Publish payload
  * ---------------
@@ -50,10 +71,13 @@
  */
 
 #include "hal.h"
+#include "board/hal_bridge.h"
+#include <assets/assets.h>
 #include <mooncake_log.h>
 #include <board.h>
 #include <mqtt.h>
 #include <wifi_manager.h>
+#include <stackchan/stackchan.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <mutex>
@@ -75,11 +99,18 @@ struct MqttMachineConfig {
     static constexpr const char* kClientId     = "stackchan-machine-ctrl";
     // TODO: Replace with your topic prefix (no trailing slash)
     static constexpr const char* kTopicPrefix  = "stackchan/machine";
+    // Topic to subscribe for text-to-alert messages
+    // Publish a UTF-8 string payload to this topic and StackChan will display
+    // it on screen with a mouth-flap animation.
+    static constexpr const char* kSpeakTopic   = "stackchan/speak";
     static constexpr int         kPublishQos   = 0;
+    static constexpr int         kSubscribeQos = 0;
     // Reconnect interval in milliseconds
     static constexpr uint32_t    kReconnectMs  = 5000;
     // Update tick interval in milliseconds
     static constexpr uint32_t    kTickMs       = 100;
+    // Duration (ms) for the mouth-flap animation when a speak message arrives
+    static constexpr uint32_t    kSpeakAnimMs  = 4000;
 };
 
 }  // namespace
@@ -91,13 +122,19 @@ struct MqttMachineConfig {
 static const std::string _tag = "HAL-MQTT";
 
 /**
- * @brief Encapsulates the MQTT connection and publish logic.
+ * @brief Encapsulates the MQTT connection, publish logic, and subscribe
+ *        text-to-alert logic.
  *
  * Driven by a dedicated FreeRTOS task (_mqtt_machine_task) so that it
  * continues to run after DestroyMooncake() is called in main.cpp.
+ *
  * Thread-safety for publishMachine() is provided by an internal
  * mutex-guarded queue so that MCP tool callbacks (running in the Xiaozhi
  * audio task) can safely enqueue publish requests without blocking.
+ *
+ * OnMessage() callbacks are dispatched to the Xiaozhi main task via
+ * hal_bridge::app_schedule() to keep all LVGL/display operations off the
+ * esp-mqtt internal task, avoiding potential deadlocks.
  */
 class MqttMachineService {
 public:
@@ -172,6 +209,12 @@ private:
         _mqtt->OnConnected([this]() {
             mclog::tagInfo(_tag, "connected to broker {}:{}", MqttMachineConfig::kBrokerHost,
                            MqttMachineConfig::kBrokerPort);
+            // Subscribe to the speak topic once connected.
+            if (_mqtt->Subscribe(MqttMachineConfig::kSpeakTopic, MqttMachineConfig::kSubscribeQos)) {
+                mclog::tagInfo(_tag, "subscribed to {}", MqttMachineConfig::kSpeakTopic);
+            } else {
+                mclog::tagError(_tag, "failed to subscribe to {}", MqttMachineConfig::kSpeakTopic);
+            }
         });
 
         _mqtt->OnDisconnected([this]() {
@@ -180,6 +223,37 @@ private:
 
         _mqtt->OnError([this](const std::string& err) {
             mclog::tagError(_tag, "MQTT error: {}", err);
+        });
+
+        /**
+         * OnMessage callback — runs in the esp-mqtt internal task context.
+         *
+         * All UI operations are dispatched to the Xiaozhi main task via
+         * app_schedule() to avoid any LVGL lock contention.
+         */
+        _mqtt->OnMessage([](const std::string& topic, const std::string& payload) {
+            mclog::tagInfo(_tag, "received: topic={}, payload={}", topic, payload);
+
+            if (topic == MqttMachineConfig::kSpeakTopic) {
+                // Capture payload by value so it is valid when the lambda runs
+                // in the Xiaozhi main task.
+                std::string text = payload;
+
+                hal_bridge::app_schedule([text]() {
+                    // 1. Display the text on the Xiaozhi UI.
+                    hal_bridge::app_alert("Message", text.c_str(), "happy");
+
+                    // 2. Play a notification chime.
+                    hal_bridge::app_play_sound(OGG_NEW_NOTIFICATION);
+
+                    // 3. Animate the avatar mouth for the duration of the message.
+                    auto& stackchan = GetStackChan();
+                    stackchan.addModifier(
+                        std::make_unique<TimedSpeechModifier>(text, MqttMachineConfig::kSpeakAnimMs));
+                    stackchan.addModifier(
+                        std::make_unique<SpeakingModifier>(MqttMachineConfig::kSpeakAnimMs));
+                });
+            }
         });
 
         mclog::tagInfo(_tag, "connecting to {}:{} as {}", MqttMachineConfig::kBrokerHost,
@@ -261,4 +335,12 @@ void Hal::mqttPublishMachine(const std::string& machineName, bool powerOn)
         return;
     }
     _service_ptr->publishMachine(machineName, powerOn);
+}
+
+void Hal::mqttSubscribeAlert()
+{
+    // Subscribe is set up automatically in _connect() -> OnConnected callback.
+    // This method exists as a named entry point for documentation and future
+    // per-topic configuration (e.g., loading kSpeakTopic from NVS).
+    mclog::tagInfo(_tag, "mqttSubscribeAlert: speak topic={}", MqttMachineConfig::kSpeakTopic);
 }

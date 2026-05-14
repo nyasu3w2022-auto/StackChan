@@ -6,6 +6,7 @@
 #pragma once
 #include "stackchan_camera.h"
 #include <cstdint>
+#include <functional>
 #include <lvgl.h>
 #include <driver/i2c_master.h>
 #include <string_view>
@@ -62,5 +63,19 @@ void board_set_speaker_volume(uint8_t volume, bool permanent = false);
 uint8_t board_get_speaker_volume();
 
 void app_play_sound(const std::string_view& sound);
+
+/**
+ * @brief Display an alert on the Xiaozhi UI (status + message + emotion + optional sound).
+ *        Thread-safe: may be called from any FreeRTOS task.
+ */
+void app_alert(const char* status, const char* message,
+               const char* emotion = "happy",
+               const std::string_view& sound = "");
+
+/**
+ * @brief Schedule a callback to run in the Xiaozhi main task context.
+ *        Thread-safe: may be called from any FreeRTOS task.
+ */
+void app_schedule(std::function<void()>&& callback);
 
 }  // namespace hal_bridge

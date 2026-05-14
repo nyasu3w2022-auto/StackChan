@@ -147,4 +147,18 @@ void app_play_sound(const std::string_view& sound)
     app.PlaySound(sound);
 }
 
+void app_alert(const char* status, const char* message,
+               const char* emotion,
+               const std::string_view& sound)
+{
+    auto& app = Application::GetInstance();
+    app.Alert(status, message, emotion, sound);
+}
+
+void app_schedule(std::function<void()>&& callback)
+{
+    auto& app = Application::GetInstance();
+    app.Schedule(std::move(callback));
+}
+
 }  // namespace hal_bridge

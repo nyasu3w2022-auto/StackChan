@@ -324,6 +324,19 @@ public:
      */
     void mqttPublishMachine(const std::string& machineName, bool powerOn);
 
+    /**
+     * @brief Subscribe to the speak topic and display received text as an alert
+     *        with a mouth-flap animation (thread-safe via Application::Schedule).
+     *
+     * The subscribed topic is defined by MqttMachineConfig::kSpeakTopic in
+     * hal_mqtt.cpp.  When a message arrives the payload is shown on the
+     * Xiaozhi UI via Application::Alert() and a TimedSpeechModifier is
+     * added to the avatar so the mouth moves.
+     *
+     * Must be called after startMqttMachineService().
+     */
+    void mqttSubscribeAlert();
+
 private:
     bool _xiaozhi_start_requested = false;
 
