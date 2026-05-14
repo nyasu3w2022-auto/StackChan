@@ -247,11 +247,11 @@ private:
                     hal_bridge::app_play_sound(OGG_NEW_NOTIFICATION);
 
                     // 3. Animate the avatar mouth for the duration of the message.
-                    auto& stackchan = GetStackChan();
-                    stackchan.addModifier(
-                        std::make_unique<TimedSpeechModifier>(text, MqttMachineConfig::kSpeakAnimMs));
-                    stackchan.addModifier(
-                        std::make_unique<SpeakingModifier>(MqttMachineConfig::kSpeakAnimMs));
+                    auto& sc = GetStackChan();
+                    sc.addModifier(
+                        std::make_unique<stackchan::TimedSpeechModifier>(text, MqttMachineConfig::kSpeakAnimMs));
+                    sc.addModifier(
+                        std::make_unique<stackchan::SpeakingModifier>(MqttMachineConfig::kSpeakAnimMs));
                 });
             }
         });
