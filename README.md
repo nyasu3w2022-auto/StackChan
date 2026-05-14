@@ -10,13 +10,14 @@ Configurations for server and topics are also in it. MQTT authentication is not 
 
   `devicename` is created by LLM for every request. Or you can make a hint at the last part of firmware/main/hal/hal_mcp.cpp.
   (Then next texts after mcp_server.AddTool("self.machine.set_power"...)
+  Just for me, changing the last sentense to "The machine_name must be room_light or ..." works well.
 
 ### subscribe
 - Show message in baloon
 
   topic: stackchan/speak
 
-  The given message (payload) is displayed with alert sound.
+  The given message (payload) is displayed in speech baloon with alert sound.
 
 ## Original README.md follows
 ---
