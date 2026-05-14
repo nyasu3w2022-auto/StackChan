@@ -73,17 +73,79 @@
 #include "hal.h"
 #include "board/hal_bridge.h"
 #include <assets/assets.h>
+#include <assets.h>
 #include <mooncake_log.h>
 #include <board.h>
+#include <display.h>
 #include <mqtt.h>
 #include <wifi_manager.h>
 #include <stackchan/stackchan.h>
+#include <stackchan/modifiers/timed.h>
+#include <lvgl_font.h>
+#include <lvgl_theme.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <mutex>
 #include <queue>
 #include <string>
 #include <memory>
+
+/* -------------------------------------------------------------------------- */
+/*                     JapaneseSpeechModifier                                  */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * @brief A TimedSpeechModifier that temporarily switches the speech bubble font
+ *        to font_noto_qwen_20_4 (which contains Japanese glyphs) for the
+ *        duration of the animation, then restores the theme default font.
+ *
+ * Font lifecycle:
+ *   _on_start() : load font_noto_qwen_20_4.bin via Assets, call setSpeechTextFont()
+ *   _on_end()   : restore the theme's default text font via Display::GetTheme()
+ *
+ * The LvglCBinFont object is owned by this modifier and is destroyed when the
+ * modifier itself is destroyed (i.e., after _on_end() fires).
+ */
+class JapaneseSpeechModifier : public stackchan::TimedSpeechModifier {
+public:
+    JapaneseSpeechModifier(std::string_view speech, uint32_t durationMs)
+        : stackchan::TimedSpeechModifier(speech, durationMs)
+    {
+    }
+
+    void _on_start(stackchan::Modifiable& sc) override
+    {
+        // Load the Japanese-capable font from the Assets partition.
+        void*  font_data = nullptr;
+        size_t font_size = 0;
+        if (Assets::GetInstance().GetAssetData(
+                "font_noto_qwen_20_4.bin", font_data, font_size) && font_data) {
+            _jp_font = std::make_unique<LvglCBinFont>(font_data);
+            sc.avatar().setSpeechTextFont((void*)_jp_font->font());
+        }
+        // Let the base class set the speech text.
+        stackchan::TimedSpeechModifier::_on_start(sc);
+    }
+
+    void _on_end(stackchan::Modifiable& sc) override
+    {
+        // Let the base class clear the speech text first.
+        stackchan::TimedSpeechModifier::_on_end(sc);
+        // Restore the theme's default font.
+        auto* display = Board::GetInstance().GetDisplay();
+        if (display) {
+            auto* theme = static_cast<LvglTheme*>(display->GetTheme());
+            if (theme && theme->text_font()) {
+                sc.avatar().setSpeechTextFont((void*)theme->text_font()->font());
+            }
+        }
+        // Release the Japanese font object.
+        _jp_font.reset();
+    }
+
+private:
+    std::unique_ptr<LvglCBinFont> _jp_font;
+};
 
 /* -------------------------------------------------------------------------- */
 /*                            Configuration                                    */
@@ -240,16 +302,18 @@ private:
                 std::string text = payload;
 
                 hal_bridge::app_schedule([text]() {
-                    // 1. Display the text on the Xiaozhi UI.
-                    hal_bridge::app_alert("Message", text.c_str(), "happy");
+                    auto& sc = GetStackChan();
+                    if (!sc.hasAvatar()) return;
 
-                    // 2. Play a notification chime.
+                    // 1. Play a notification chime.
                     hal_bridge::app_play_sound(OGG_NEW_NOTIFICATION);
 
-                    // 3. Animate the avatar mouth for the duration of the message.
-                    auto& sc = GetStackChan();
+                    // 2. Animate the avatar mouth and display the speech bubble.
+                    //    JapaneseSpeechModifier switches to font_noto_qwen_20_4 on
+                    //    start and restores the theme font on end, so the LvglCBinFont
+                    //    object lifetime is tied to the modifier's lifetime.
                     sc.addModifier(
-                        std::make_unique<stackchan::TimedSpeechModifier>(text, MqttMachineConfig::kSpeakAnimMs));
+                        std::make_unique<JapaneseSpeechModifier>(text, MqttMachineConfig::kSpeakAnimMs));
                     sc.addModifier(
                         std::make_unique<stackchan::SpeakingModifier>(MqttMachineConfig::kSpeakAnimMs));
                 });
