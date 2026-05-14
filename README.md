@@ -1,3 +1,25 @@
+# Extended m5stack/stackchan for mqtt communication
+## communication with MQTT
+The extended source code is mainly in firmware/main/hal/hal_mqtt.cpp.
+Configurations for server and topics are also in it. MQTT authentication is not implemented.
+
+### publish
+- device power on/off
+
+  topic: stackchan/machine/`devicename` payload: 0 or 1
+
+  `devicename` is created by LLM for every request. Or you can make a hint at the last part of firmware/main/hal/hal_mcp.cpp.
+  (Then next texts after mcp_server.AddTool("self.machine.set_power"...)
+
+### subscribe
+- Show message in baloon
+
+  topic: stackchan/speak
+
+  The given message (payload) is displayed with alert sound.
+
+## Original README.md follows
+---
 # StackChan Open-Source
 
 <img src="https://m5stack-doc.oss-cn-shenzhen.aliyuncs.com/1205/K151_stack_chan_main_pictures_01.webp" width="60%">
